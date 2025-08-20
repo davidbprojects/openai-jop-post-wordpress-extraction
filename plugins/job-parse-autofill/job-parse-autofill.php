@@ -1,8 +1,8 @@
 <?php
 /**
  * Plugin Name: Job Parse Autofill
- * Description: Paste a job posting URL; server fetches the page, extracts structured fields via OpenAI, and auto-fills your form fields.
- * Version: 1.4.0
+ * Description: Paste a job posting URL; server fetches the page, extracts structured fields via OpenAI, and auto-fills your Short.io Link Maker form. Keeps preview after page reload.
+ * Version: 1.6.2
  * Author: David Bogar
  * Requires at least: 5.8
  * Requires PHP: 7.4
@@ -68,9 +68,8 @@ class JobParseAutofill {
       <h2>How to use</h2>
       <ol>
         <li>Save your OpenAI key above.</li>
-        <li>Add the shortcode <code>[jobparse]</code> to the page containing your form.</li>
-        <li>Ensure your form IDs: <code>#company_name</code>, <code>#company_title</code>, <code>#my_title</code>, <code>#skill_1..#skill_5</code>, <code>#shortpath</code>.</li>
-        <li>Enter a job posting URL and click <em>Extract fields</em>.</li>
+        <li>Put the extractor shortcode <code>[jobparse]</code> on the same page as your Short.io Link Maker form shortcode <code>[shortio_link_form]</code> (extractor above the form).</li>
+        <li>Paste a job URL and click <em>Extract fields</em>. It fills: <code>company</code>, <code>skill1..skill5</code>, <code>mytitle</code>, <code>yourtitle</code>, <code>slug</code>.</li>
       </ol>
     </div>
   <?php }
@@ -78,7 +77,6 @@ class JobParseAutofill {
   /* ---------------- REST API ---------------- */
 
   public function register_rest() {
-    // EXTRACT: POST only, requires login + nonce
     register_rest_route(self::REST_NS, self::ROUTE_EXTRACT, [
       'methods'  => 'POST',
       'callback' => [$this, 'handle_extract'],
@@ -87,7 +85,6 @@ class JobParseAutofill {
       }
     ]);
 
-    // DIAG: POST, quick connectivity & auth test (no OpenAI key cost)
     register_rest_route(self::REST_NS, self::ROUTE_DIAG, [
       'methods'  => 'POST',
       'callback' => [$this, 'handle_diag'],
@@ -103,7 +100,6 @@ class JobParseAutofill {
     $out['nonce_ok']  = (bool) wp_verify_nonce($req->get_header('X-WP-Nonce'), 'wp_rest');
     $out['openai_key_present'] = (bool) get_option(self::OPT_KEY, '');
 
-    // OpenAI connectivity test (401 means network OK without key)
     $m = wp_remote_get('https://api.openai.com/v1/models', ['timeout'=>10]);
     $out['openai_http'] = is_wp_error($m) ? $m->get_error_message() : wp_remote_retrieve_response_code($m);
 
@@ -126,14 +122,12 @@ class JobParseAutofill {
 
   public function handle_extract(WP_REST_Request $req) {
     try {
-      // 0) Validate inputs & key
       $url = trim((string)$req->get_param('url'));
       if (!$url) return new WP_Error('no_url', 'Missing URL', ['status'=>400]);
 
       $api_key = get_option(self::OPT_KEY, '');
       if (!$api_key) return new WP_Error('no_key', 'OpenAI key not configured', ['status'=>500]);
 
-      // 1) Fetch the page (HTML or JSON ATS)
       $fetched = $this->fetch_url_text($url);
       if (is_wp_error($fetched)) {
         return new WP_REST_Response([
@@ -143,26 +137,20 @@ class JobParseAutofill {
         ], 200);
       }
 
-      // 2) Build schema + prompt (Structured Outputs)
+      // Structured outputs schema
       $schema_object = [
         'type' => 'object',
         'additionalProperties' => false,
-        'required' => ['company_name','job_title','top_skills','more_skills','summary'],
         'properties' => [
-          'company_name' => ['type' => 'string', 'description' => 'Company or organization name'],
-          'salary_range' => ['type' => 'string', 'description' => 'Salary as written (e.g., "$140k–$180k + bonus"). Empty string if none.'],
-          'top_skills' => [
-            'type' => 'array', 'minItems' => 5, 'maxItems' => 5,
-            'items' => ['type' => 'string', 'description' => 'One concise skill']
-          ],
-          'more_skills' => [
-            'type' => 'array', 'minItems' => 10, 'maxItems' => 10,
-            'items' => ['type' => 'string', 'description' => 'Additional skills ordered by importance']
-          ],
-          'company_homepage' => ['type' => 'string', 'description' => 'Homepage URL if obvious; else empty string'],
-          'job_title' => ['type' => 'string', 'description' => 'Job title'],
-          'summary'  => ['type' => 'string', 'description' => 'Up to ~25 words summary of what they seek']
-        ]
+          'company_name'     => ['type' => 'string'],
+          'salary_range'     => ['type' => 'string'],
+          'top_skills'       => ['type' => 'array', 'minItems'=>5,  'maxItems'=>5,  'items'=>['type'=>'string']],
+          'more_skills'      => ['type' => 'array', 'minItems'=>10, 'maxItems'=>10, 'items'=>['type'=>'string']],
+          'company_homepage' => ['type' => 'string'],
+          'job_title'        => ['type' => 'string'],
+          'summary'          => ['type' => 'string']
+        ],
+        'required' => ['company_name','salary_range','top_skills','more_skills','company_homepage','job_title','summary']
       ];
 
       $domain_hint = parse_url($fetched['url'], PHP_URL_HOST);
@@ -173,30 +161,23 @@ class JobParseAutofill {
         "Page Title: {$fetched['title']}\n".
         "Meta Description: {$fetched['meta_desc']}\n\n".
         "TASKS:\n".
-        "1) company_name: concise name\n".
-        "2) salary_range: salary as written; empty if none\n".
-        "3) top_skills: EXACTLY 5 items, ordered by importance\n".
-        "4) more_skills: EXACTLY 10 items, ordered by importance (next 10)\n".
-        "5) company_homepage: official homepage if obvious; else empty. If source is company domain, use its root URL\n".
-        "6) job_title: concise job title\n".
-        "7) summary: <= 25 words describing what they seek\n\n".
+        "1) company_name\n2) salary_range (empty if none)\n3) top_skills (exactly 5)\n4) more_skills (exactly 10)\n".
+        "5) company_homepage (root if company domain)\n6) job_title\n7) summary (<= 25 words)\n\n".
         "TEXT CONTENT START\n{$fetched['text']}\nTEXT CONTENT END\n";
 
       $body = [
         'model' => 'gpt-4o-mini',
         'input' => $prompt,
-        // NEW Responses API format for Structured Outputs
         'text'  => [
           'format' => [
-            'type'        => 'json_schema',
-            'name'        => 'job_fields',
-            'json_schema' => $schema_object,
-            'strict'      => true
+            'type'   => 'json_schema',
+            'name'   => 'job_fields',
+            'schema' => $schema_object,
+            'strict' => true
           ]
         ]
       ];
 
-      // 3) Call OpenAI
       $resp = wp_remote_post('https://api.openai.com/v1/responses', [
         'headers' => [
           'Authorization' => 'Bearer ' . $api_key,
@@ -225,7 +206,6 @@ class JobParseAutofill {
         ], 200);
       }
 
-      // 4) Parse OpenAI envelope robustly
       $json = json_decode($raw, true);
       $parsed = $json['output'][0]['content'][0]['json']
              ?? $this->maybe_decode_json($json['output'][0]['content'][0]['text'] ?? null)
@@ -239,7 +219,6 @@ class JobParseAutofill {
         ], 200);
       }
 
-      // 5) Normalize & return final JSON
       $arrN = function($arr, $n){
         $arr = is_array($arr) ? array_map('strval', $arr) : [];
         $arr = array_slice($arr, 0, $n);
@@ -320,7 +299,6 @@ class JobParseAutofill {
     $meta_desc = '';
     if (preg_match('#<meta[^>]+name=["\']description["\'][^>]*content=["\']([^"\']+)#i', $body, $m)) $meta_desc = wp_strip_all_tags($m[1]);
 
-    // JSON ATS endpoints (Lever/Greenhouse/Workday, etc.)
     $looks_json = (stripos($ctype, 'json') !== false) || preg_match('/^\s*[\{\[]/s', $body);
     if ($looks_json) {
       $j = json_decode($body, true);
@@ -359,7 +337,6 @@ class JobParseAutofill {
       }
     }
 
-    // HTML fallback: strip scripts/styles/comments → text
     $html = $body;
     $html = preg_replace('#<script\b[^>]*>.*?</script>#is', ' ', $html);
     $html = preg_replace('#<style\b[^>]*>.*?</style>#is', ' ', $html);
@@ -370,7 +347,6 @@ class JobParseAutofill {
     $text = preg_replace('/\s{2,}/', "\n", trim($text));
     if (mb_strlen($text) > 300000) $text = mb_substr($text, 0, 300000);
 
-    // Non-HTML types (pdf, etc.) — bail clearly unless it looked like HTML/JSON
     if ($ctype && stripos($ctype, 'text/html') === false) {
       if (stripos(ltrim($body), '<!DOCTYPE') === false && stripos(ltrim($body), '<html') === false && !$looks_json) {
         return new WP_Error('not_html', 'Content is not HTML/JSON.', ['status' => 415]);
@@ -388,7 +364,7 @@ class JobParseAutofill {
   /* ---------------- Shortcode & assets ---------------- */
 
   public function register_assets() {
-    wp_register_script('jobparse-inline', '', [], '1.4.0', true);
+    wp_register_script('jobparse-inline', '', [], '1.6.2', true);
   }
 
   public function shortcode($atts = []) {
@@ -398,13 +374,21 @@ class JobParseAutofill {
       <div id="jobparse-wrap" style="margin: 1rem 0;">
         <label for="job_url" style="font-weight:600; display:block; margin-bottom:.25rem;">Job posting URL</label>
         <input id="job_url" type="url" placeholder="https://example.com/careers/job-id" style="width:100%;"/>
-        <div style="margin-top:.5rem; display:flex; gap:.5rem; align-items:center;">
+
+        <div style="margin-top:.5rem; display:flex; gap:.75rem; align-items:center; flex-wrap:wrap;">
           <button id="extract_btn" type="button">Extract fields</button>
           <button id="diag_btn" type="button" title="Connectivity check">Diag</button>
+
+          <label style="display:flex; align-items:center; gap:.35rem;">
+            <input id="jp_autosubmit" type="checkbox" checked />
+            <span>Auto-create Short.io link after fill</span>
+          </label>
+
+          <a href="#" id="jp_clear" style="margin-left:.5rem;">Clear preview</a>
+
           <span id="extract_status" style="line-height:32px;"></span>
         </div>
 
-        <!-- Optional: quick preview -->
         <div id="jobparse-preview" style="margin-top:1rem; display:none;">
           <div><strong>Company:</strong> <span data-k="company_name"></span></div>
           <div><strong>Job Title:</strong> <span data-k="job_title"></span></div>
@@ -418,65 +402,201 @@ class JobParseAutofill {
 
       <script>
       (function(){
+        const log = (...a)=>{ if (window.jobparseDebug) console.log('[jobparse]', ...a); };
         const nonce = <?php echo json_encode($nonce); ?>;
-        const MAP = {
-          company_name:   '#company_name',
-          company_title:  '#company_title',
-          my_title:       '#my_title',
-          shortpath:      '#shortpath',
-          skills: ['#skill_1','#skill_2','#skill_3','#skill_4','#skill_5']
-        };
+        const STORE_KEY = 'jobparse.last';   // holds {data, jobUrl, autosubmitOnce, submitted}
+        const PREVIEW_TTL_MS = 15*60*1000;   // keep preview for 15 minutes
 
-        function $(sel){ return document.querySelector(sel); }
-        function setVal(selector, value){
-          if (!selector) return;
-          const el = $(selector);
-          if (el) el.value = value || '';
+        // Persisted toggle
+        const toggle = document.getElementById('jp_autosubmit');
+        if (toggle) {
+          const saved = localStorage.getItem('jp_autosubmit');
+          if (saved != null) toggle.checked = saved === '1';
+          toggle.addEventListener('change', () => localStorage.setItem('jp_autosubmit', toggle.checked ? '1' : '0'));
+        }
+
+        // Helpers
+        const $ = (sel, root=document)=> root.querySelector(sel);
+        function resolveEl(target, root=document){
+          if (!target) return null;
+          if (target instanceof Element) return target;
+          if (typeof target === 'string') return $(target, root);
+          return null;
+        }
+        function setVal(target, value){
+          const el = resolveEl(target);
+          if (!el) { console.warn('[jobparse] setVal: not found ->', target); return; }
+          if ('value' in el) el.value = value ?? '';
+          else el.textContent = value ?? '';
+          el.dispatchEvent(new Event('input',  { bubbles:true }));
+          el.dispatchEvent(new Event('change', { bubbles:true }));
+        }
+        function setText(target, value){
+          const el = resolveEl(target);
+          if (!el) { console.warn('[jobparse] setText: not found ->', target); return; }
+          el.textContent = value ?? '';
         }
         function slugify(str){
           return (str || '')
-            .toString()
-            .normalize('NFKD')
-            .replace(/[\u0300-\u036f]/g, '')
-            .replace(/[^a-zA-Z0-9]+/g, '-')
-            .replace(/^-+|-+$/g, '')
-            .toLowerCase();
+            .toString().normalize('NFKD').replace(/[\u0300-\u036f]/g, '')
+            .replace(/[^a-zA-Z0-9]+/g, '-').replace(/^-+|-+$/g, '').toLowerCase();
         }
+        function sleep(ms){ return new Promise(r => setTimeout(r, ms)); }
+
+        // Your Short.io Link Maker form fields
+        const MAP = {
+          company:  'input[name="company"]',
+          skills: [
+            'input[name="skill1"]',
+            'input[name="skill2"]',
+            'input[name="skill3"]',
+            'input[name="skill4"]',
+            'input[name="skill5"]'
+          ],
+          mytitle:   'input[name="mytitle"]',
+          yourtitle: 'input[name="yourtitle"]',
+          slug:      'input[name="slug"]'
+        };
+
+        function locateYourForm(){
+          let form = document.querySelector('form:has(input[name="company"])');
+          if (!form) {
+            const candidate = document.querySelector('input[name="company"]');
+            if (candidate) form = candidate.closest('form');
+          }
+          return form || null;
+        }
+        function waitForYourForm(timeoutMs = 10000){
+          return new Promise(resolve => {
+            const f = locateYourForm();
+            if (f) return resolve(f);
+            const obs = new MutationObserver(()=>{
+              const ff = locateYourForm();
+              if (ff) { obs.disconnect(); resolve(ff); }
+            });
+            obs.observe(document.documentElement, {childList:true, subtree:true});
+            setTimeout(()=>{ obs.disconnect(); resolve(locateYourForm()); }, timeoutMs);
+          });
+        }
+
+        function companyFallback(data){
+          let fallbackCompany = '';
+          try {
+            const source = (data.company_homepage || '') || (window.lastJobUrl || '');
+            if (source) {
+              const u = new URL(source);
+              const parts = u.hostname.replace(/^www\./,'').split('.').filter(Boolean);
+              fallbackCompany = (parts.slice(-2, -1)[0] || parts[0] || '').replace(/[-_]/g, ' ');
+            }
+          } catch {}
+          return fallbackCompany;
+        }
+
+        function fillYourForm(form, data){
+          const comp = (data.company_name || '').trim() || companyFallback(data);
+          setVal(MAP.company, comp);
+          const skills = Array.isArray(data.top_skills) ? data.top_skills : [];
+          for (let i=0;i<5;i++) setVal(MAP.skills[i], skills[i] || '');
+          setVal(MAP.mytitle,   data.job_title || '');
+          setVal(MAP.yourtitle, data.job_title || '');
+          setVal(MAP.slug,      slugify(comp || ''));
+        }
+
         function showPreview(data){
-          const wrap = $('#jobparse-preview');
+          const wrap = document.getElementById('jobparse-preview');
           if (!wrap) return;
           wrap.style.display = 'block';
-          const setText = (k, val) => {
-            const node = wrap.querySelector(`[data-k="${k}"]`);
-            if (!node) return;
-            node.textContent = val || '';
-          }
-          setText('company_name', data.company_name);
-          setText('job_title', data.job_title);
-          setText('salary_range', data.salary_range);
-          setText('summary', data.summary);
-          const linkNode = wrap.querySelector('[data-k="company_homepage_link"]');
+          setText('[data-k="company_name"]', data.company_name || companyFallback(data));
+          setText('[data-k="job_title"]', data.job_title || '');
+          setText('[data-k="salary_range"]', data.salary_range || '');
+          setText('[data-k="summary"]', data.summary || '');
+          const linkNode = document.querySelector('[data-k="company_homepage_link"]');
           if (linkNode) {
             const url = (data.company_homepage || '').trim();
             linkNode.textContent = url || '';
             if (url) { linkNode.href = url; } else { linkNode.removeAttribute('href'); }
           }
-          const top = (data.top_skills || []).filter(Boolean).join(', ');
-          const more = (data.more_skills || []).filter(Boolean).join(', ');
-          setText('top_skills', top);
-          setText('more_skills', more);
+          setText('[data-k="top_skills"]',  (data.top_skills  || []).filter(Boolean).join(', '));
+          setText('[data-k="more_skills"]', (data.more_skills || []).filter(Boolean).join(', '));
+        }
+
+        function loadPersisted() {
+          try {
+            const raw = sessionStorage.getItem(STORE_KEY);
+            if (!raw) return null;
+            const obj = JSON.parse(raw);
+            if (!obj || !obj.data) return null;
+            // TTL
+            if (obj.ts && (Date.now() - obj.ts > PREVIEW_TTL_MS)) {
+              sessionStorage.removeItem(STORE_KEY);
+              return null;
+            }
+            return obj;
+          } catch { return null; }
+        }
+        function savePersisted(payload) {
+          try { sessionStorage.setItem(STORE_KEY, JSON.stringify(payload)); } catch {}
+        }
+        function clearPersisted() { try { sessionStorage.removeItem(STORE_KEY); } catch {} }
+
+        async function maybeSubmitYourForm(form, payload){
+          const auto = document.getElementById('jp_autosubmit')?.checked;
+          if (!auto || !form) return;
+
+          // Avoid re-submitting after reload
+          if (payload) {
+            payload.autosubmitOnce = true;
+            payload.submitted = true;
+            savePersisted(payload);
+          }
+
+          await sleep(60);
+          const missing = Array.from(form.querySelectorAll('input[required],textarea[required],select[required]'))
+            .filter(el => !String(el.value || '').trim());
+          if (missing.length) { missing[0].focus(); return; }
+
+          const btn = form.querySelector('button[type="submit"], input[type="submit"]');
+          if (btn) { btn.click(); return; }
+          form.requestSubmit ? form.requestSubmit() : form.submit();
+        }
+
+        // Rehydrate on page load (after a POST reload)
+        (async function rehydrateOnLoad(){
+          const persisted = loadPersisted();
+          if (!persisted) return;
+
+          // Always re-show preview
+          showPreview(persisted.data);
+
+          // If we already submitted once, just keep the preview and fill the form again for convenience
+          const form = await waitForYourForm(5000);
+          if (form) fillYourForm(form, persisted.data);
+
+          // If it wasn't submitted (e.g., you unchecked auto), keep it around; else, we can keep it until user clears
+        })();
+
+        // Clear preview link
+        const clearBtn = document.getElementById('jp_clear');
+        if (clearBtn) {
+          clearBtn.addEventListener('click', (e)=>{
+            e.preventDefault();
+            clearPersisted();
+            const wrap = document.getElementById('jobparse-preview');
+            if (wrap) { wrap.style.display = 'none'; wrap.querySelectorAll('[data-k]').forEach(n=>n.textContent=''); }
+          });
         }
 
         async function extract() {
-          const status = $('#extract_status');
-          const url = ($('#job_url')?.value || '').trim();
+          const status = document.getElementById('extract_status');
+          const url = (document.getElementById('job_url')?.value || '').trim();
           if (!url) { alert('Enter a job posting URL.'); return; }
+          window.lastJobUrl = url;
 
           status.textContent = 'Fetching & extracting…';
           try {
             const res = await fetch('<?php echo esc_url_raw( rest_url(self::REST_NS . self::ROUTE_EXTRACT) ); ?>', {
               method: 'POST',
-              headers: { 'Content-Type': 'application/json', 'X-WP-Nonce': nonce },
+              headers: { 'Content-Type': 'application/json', 'X-WP-Nonce': <?php echo json_encode($nonce); ?> },
               credentials: 'same-origin',
               body: JSON.stringify({ url })
             });
@@ -494,16 +614,23 @@ class JobParseAutofill {
               return;
             }
 
-            // Autofill:
-            setVal(MAP.company_name, data.company_name || '');
-            const skills = Array.isArray(data.top_skills) ? data.top_skills : [];
-            for (let i=0;i<5;i++) setVal(MAP.skills[i], skills[i] || '');
-            setVal(MAP.my_title, data.job_title || '');
-            setVal(MAP.company_title, data.job_title || '');
-            setVal(MAP.shortpath, slugify(data.company_name || ''));
-
+            // Show preview immediately and persist before any submit
             showPreview(data);
-            status.textContent = 'Done.';
+            const payload = { data, jobUrl: url, ts: Date.now(), autosubmitOnce: false, submitted: false };
+            savePersisted(payload);
+
+            // Fill Short.io form
+            const form = await waitForYourForm(10000);
+            if (!form) {
+              status.textContent = 'Extracted (no Short.io form found).';
+              return;
+            }
+            fillYourForm(form, data);
+            status.textContent = 'Filled.';
+
+            // Auto-submit once, while keeping preview persistent across reload
+            await maybeSubmitYourForm(form, payload);
+
           } catch (e) {
             console.error(e);
             status.textContent = '';
@@ -512,13 +639,13 @@ class JobParseAutofill {
         }
 
         async function diag() {
-          const status = $('#extract_status');
-          const url = ($('#job_url')?.value || '').trim();
+          const status = document.getElementById('extract_status');
+          const url = (document.getElementById('job_url')?.value || '').trim();
           status.textContent = 'Diagnosing…';
           try {
             const res = await fetch('<?php echo esc_url_raw( rest_url(self::REST_NS . self::ROUTE_DIAG) ); ?>', {
               method: 'POST',
-              headers: { 'Content-Type': 'application/json', 'X-WP-Nonce': nonce },
+              headers: { 'Content-Type': 'application/json', 'X-WP-Nonce': <?php echo json_encode($nonce); ?> },
               credentials: 'same-origin',
               body: JSON.stringify({ url })
             });
